@@ -46,12 +46,16 @@ class PMECalculator(Calculator):
         set to :obj:`False`, a "half" neighbor list is expected.
     """
 
+    # TorchScript requires class-level annotations for non-Tensor list attributes.
+    _fixed_ns_mesh: list[int]
+
     def __init__(
         self,
         potential: Potential,
         mesh_spacing: float,
         interpolation_nodes: int = 4,
         full_neighbor_list: bool = False,
+        ns_mesh: Optional[tuple[int, int, int]] = None,
     ):
         super().__init__(potential=potential, full_neighbor_list=full_neighbor_list)
 
@@ -63,6 +67,15 @@ class PMECalculator(Calculator):
             raise ValueError(f"`smearing` is {potential.smearing} but must be positive")
 
         self.mesh_spacing: float = mesh_spacing
+
+        # When set, ``_fixed_ns_mesh`` is a length-3 list of ints that bypasses the
+        # per-forward ``get_ns_mesh`` CPU sync entirely. Dynamo specialises the list
+        # values as constants → 0 graph breaks → one clean CUDA graph. The cell-derived
+        # reciprocal quantities (kvectors, filter, weights) are still recomputed each
+        # forward, so autograd on ``cell`` is fully preserved. When empty the adaptive
+        # path is used (a single ``tolist`` sync per forward). Use ``list[int]`` rather
+        # than ``tuple`` for TorchScript compatibility.
+        self._fixed_ns_mesh: list[int] = list(ns_mesh) if ns_mesh is not None else []
 
         cell = torch.eye(
             3,
@@ -112,13 +125,21 @@ class PMECalculator(Calculator):
                 "Batching not implemented for mesh-based calculators"
             )
 
-        # Number of mesh points along each axis, and a Python int triple for the pure
-        # helpers. The mesh shape is data-dependent on ``cell``, so extracting it is the
-        # single unavoidable CPU sync per forward; doing it via one ``tolist`` keeps it
-        # to a single ``torch.compile`` graph break instead of one per axis.
-        ns = get_ns_mesh(cell, self.mesh_spacing)
-        ns_list: list[int] = ns.tolist()
-        ns_mesh = (ns_list[0], ns_list[1], ns_list[2])
+        # Mesh shape as a Python int triple for the pure helpers.
+        # Fixed path: ns_mesh is a compile-time constant → 0 graph breaks, enabling
+        # one clean CUDA graph under mode="reduce-overhead".
+        # Adaptive path: one tolist() sync per forward (3 data-dependent breaks).
+        if len(self._fixed_ns_mesh) == 3:
+            ns_mesh = (
+                self._fixed_ns_mesh[0],
+                self._fixed_ns_mesh[1],
+                self._fixed_ns_mesh[2],
+            )
+            ns = torch.tensor(ns_mesh, device=cell.device, dtype=torch.long)
+        else:
+            ns = get_ns_mesh(cell, self.mesh_spacing)
+            ns_list: list[int] = ns.tolist()
+            ns_mesh = (ns_list[0], ns_list[1], ns_list[2])
 
         if cell.is_cuda:
             # use a routine that does not synchronize with the CPU
