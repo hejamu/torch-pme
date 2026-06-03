@@ -547,3 +547,69 @@ def test_wrong_method():
     match = "method 'foo' is not supported. Choose from 'Lagrange' or 'P3M'"
     with pytest.raises(ValueError, match=match):
         MeshInterpolator(torch.eye(3), torch.ones(3), 2, method="foo")
+
+
+@pytest.mark.parametrize(
+    ("interpolation_nodes", "method"),
+    [(n, "P3M") for n in [1, 2, 3, 4, 5]] + [(n, "Lagrange") for n in [3, 4, 5, 6, 7]],
+)
+def test_pure_methods_match_class_api(interpolation_nodes, method):
+    """
+    The pure (``*_pure``) methods must produce bit-identical results to the
+    stateful class API they back.
+    """
+    torch.manual_seed(0)
+    n_particles, n_channels = 12, 3
+    L = 6.28318530717
+    cell = torch.eye(3) * L
+    ns_mesh = torch.tensor([20, 18, 16])
+    positions = torch.rand((n_particles, 3)) * L
+    particle_weights = 3 * torch.randn((n_particles, n_channels))
+
+    mi = MeshInterpolator(
+        cell=cell,
+        ns_mesh=ns_mesh,
+        interpolation_nodes=interpolation_nodes,
+        method=method,
+    )
+
+    # Stateful class API
+    mi.compute_weights(positions)
+    rho_class = mi.points_to_mesh(particle_weights)
+    interpolated_class = mi.mesh_to_points(rho_class)
+
+    # Pure API: everything passed in / returned, nothing read from or written to self
+    inverse_cell = torch.linalg.inv(cell)
+    (
+        weights,
+        x_shifts,
+        y_shifts,
+        z_shifts,
+        x_indices,
+        y_indices,
+        z_indices,
+    ) = mi.compute_weights_pure(positions, inverse_cell, ns_mesh)
+    rho_pure = mi.points_to_mesh_pure(
+        particle_weights,
+        weights,
+        x_shifts,
+        y_shifts,
+        z_shifts,
+        x_indices,
+        y_indices,
+        z_indices,
+        (20, 18, 16),
+    )
+    interpolated_pure = mi.mesh_to_points_pure(
+        rho_pure,
+        weights,
+        x_shifts,
+        y_shifts,
+        z_shifts,
+        x_indices,
+        y_indices,
+        z_indices,
+    )
+
+    assert_close(rho_class, rho_pure, rtol=0.0, atol=0.0)
+    assert_close(interpolated_class, interpolated_pure, rtol=0.0, atol=0.0)

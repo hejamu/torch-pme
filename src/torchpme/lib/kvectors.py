@@ -74,6 +74,46 @@ def _generate_kvectors(
     return kxs[:, None, None] + kys[None, :, None] + kzs[None, None, :]
 
 
+def generate_kvectors_for_mesh_from_shape(
+    cell: torch.Tensor,
+    inverse_cell: torch.Tensor,
+    ns_mesh: tuple[int, int, int],
+) -> torch.Tensor:
+    """
+    ``torch.compile``-friendly variant of :func:`generate_kvectors_for_mesh`.
+
+    Identical result to ``generate_kvectors_for_mesh(cell, ns)`` (for the FFT/mesh
+    convention) but takes the mesh shape as a Python ``(int, int, int)`` tuple and the
+    precomputed ``inverse_cell``. Because the FFT sizes are concrete Python ints,
+    :func:`torch.fft.fftfreq` is not called with a data-dependent tensor argument, so no
+    ``torch.compile`` graph break / CPU sync happens inside this function. Differentiable
+    w.r.t. ``cell`` through ``inverse_cell``.
+
+    :param cell: torch.tensor of shape ``(3, 3)`` (used only for dtype/device).
+    :param inverse_cell: torch.tensor of shape ``(3, 3)``, the inverse of ``cell``.
+    :param ns_mesh: mesh shape ``(nx, ny, nz)`` as Python ints.
+    :return: torch.tensor of shape ``(nx, ny, nz // 2 + 1, 3)``.
+    """
+    nx, ny, nz = ns_mesh
+
+    reciprocal_cell = 2 * torch.pi * inverse_cell.T
+    bx = reciprocal_cell[0]
+    by = reciprocal_cell[1]
+    bz = reciprocal_cell[2]
+
+    kxs = (bx * nx) * torch.fft.fftfreq(
+        nx, device=cell.device, dtype=cell.dtype
+    ).unsqueeze(-1)
+    kys = (by * ny) * torch.fft.fftfreq(
+        ny, device=cell.device, dtype=cell.dtype
+    ).unsqueeze(-1)
+    kzs = (bz * nz) * torch.fft.rfftfreq(
+        nz, device=cell.device, dtype=cell.dtype
+    ).unsqueeze(-1)
+
+    return kxs[:, None, None] + kys[None, :, None] + kzs[None, None, :]
+
+
 def generate_kvectors_for_mesh(cell: torch.Tensor, ns: torch.Tensor) -> torch.Tensor:
     """
     Compute all reciprocal space vectors for Fourier space sums.
