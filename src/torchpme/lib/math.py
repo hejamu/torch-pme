@@ -76,7 +76,7 @@ def exp1(x):
     return _CustomExp1.apply(x)
 
 
-def gammaincc_over_powerlaw(exponent: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+def gammaincc_over_powerlaw(exponent: int, z: torch.Tensor) -> torch.Tensor:
     """
     Compute the regularized incomplete gamma function complement for integer exponents.
 

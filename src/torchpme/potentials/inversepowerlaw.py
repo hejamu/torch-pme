@@ -1,9 +1,10 @@
+import math
 from typing import Optional
 
 import torch
 from torch.special import gammainc
 
-from torchpme.lib import gamma, gammaincc_over_powerlaw
+from torchpme.lib import gammaincc_over_powerlaw
 
 from .coulomb import _pbc_correction
 from .potential import Potential
@@ -51,7 +52,12 @@ class InversePowerLawPotential(Potential):
 
         # function call to check the validity of the exponent
         gammaincc_over_powerlaw(exponent, torch.tensor(1.0))
-        self.register_buffer("exponent", torch.tensor(exponent, dtype=torch.float64))
+        # Store the exponent as a plain Python ``int`` rather than a tensor buffer: it is
+        # a fixed hyperparameter used in ``if`` branches (e.g. ``if self.exponent > 3``),
+        # and branching on a tensor is data-dependent control flow that breaks
+        # ``torch.compile``. Keeping it a scalar also makes the ``gamma`` terms below
+        # compile-time constants.
+        self.exponent = exponent
 
     @torch.jit.export
     def from_dist(
@@ -100,8 +106,13 @@ class InversePowerLawPotential(Potential):
         x = 0.5 * dist**2 / self.smearing**2
         peff = self.exponent / 2
         prefac = 1.0 / (2 * self.smearing**2) ** peff
+        # ``gammainc`` requires a tensor for its first argument; build it on ``x``'s
+        # device/dtype so it works on any device (and under ``torch.compile``).
+        peff_tensor = x.new_full((), peff)
         result = (
-            prefac * gammainc(peff, x.clamp(min=1e-15)) / (x.clamp(min=1e-15) ** peff)
+            prefac
+            * gammainc(peff_tensor, x.clamp(min=1e-15))
+            / (x.clamp(min=1e-15) ** peff)
         )
         if pair_mask is not None:
             result = result * pair_mask
@@ -122,7 +133,9 @@ class InversePowerLawPotential(Potential):
 
         peff = (3 - self.exponent) / 2
         prefac = (
-            torch.pi**1.5 / gamma(self.exponent / 2) * (2 * self.smearing**2) ** peff
+            torch.pi**1.5
+            / math.gamma(self.exponent / 2)
+            * (2 * self.smearing**2) ** peff
         )
         x = 0.5 * self.smearing**2 * k_sq
 
@@ -149,7 +162,7 @@ class InversePowerLawPotential(Potential):
                 "Cannot compute self contribution without specifying `smearing`."
             )
         phalf = self.exponent / 2
-        return self.prefactor / gamma(phalf + 1) / (2 * self.smearing**2) ** phalf
+        return self.prefactor / math.gamma(phalf + 1) / (2 * self.smearing**2) ** phalf
 
     def background_correction(self) -> torch.Tensor:
         # "charge neutrality" correction for 1/r^p potential diverges for exponent p = 3
@@ -162,7 +175,7 @@ class InversePowerLawPotential(Potential):
         if self.exponent >= 3:
             return torch.zeros_like(self.smearing)
         prefac = torch.pi**1.5 * (2 * self.smearing**2) ** ((3 - self.exponent) / 2)
-        prefac /= (3 - self.exponent) * gamma(self.exponent / 2)
+        prefac /= (3 - self.exponent) * math.gamma(self.exponent / 2)
         return self.prefactor * prefac
 
     def pbc_correction(self, periodic, positions, cell, charges):
