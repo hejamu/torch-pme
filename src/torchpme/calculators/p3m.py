@@ -1,6 +1,9 @@
+from typing import Optional
+
 import torch
 
 from ..lib.kspace_filter import P3MKSpaceFilter
+from ..lib.kvectors import get_ns_mesh
 from ..lib.mesh_interpolator import MeshInterpolator
 from ..potentials import Potential
 from .pme import PMECalculator
@@ -82,3 +85,49 @@ class P3MCalculator(PMECalculator):
             method="P3M",
         )
         self.interpolation_nodes: int = interpolation_nodes
+
+    def _compute_kspace(
+        self,
+        charges: torch.Tensor,
+        cell: torch.Tensor,
+        positions: torch.Tensor,
+        periodic: Optional[torch.Tensor] = None,
+        node_mask: Optional[torch.Tensor] = None,
+        kvectors: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # P3M keeps the original stateful path: its reciprocal-space filter includes a
+        # cell-dependent influence function (``P3MKSpaceFilter._compute_influence``)
+        # that is not yet ported to the pure, ``torch.compile``-friendly formulation
+        # used by ``PMECalculator._compute_kspace``. Overriding here preserves P3M's
+        # exact behaviour (including the NaN guard in ``KSpaceFilter.forward``).
+        if node_mask is not None or kvectors is not None:
+            raise NotImplementedError(
+                "Batching not implemented for mesh-based calculators"
+            )
+        ns = get_ns_mesh(cell, self.mesh_spacing)
+
+        self.mesh_interpolator.update(cell, ns)
+
+        self.kspace_filter.update(cell, ns)
+
+        self.mesh_interpolator.compute_weights(positions)
+        rho_mesh = self.mesh_interpolator.points_to_mesh(particle_weights=charges)
+
+        potential_mesh = self.kspace_filter.forward(rho_mesh)
+
+        ivolume = torch.abs(cell.det()).pow(-1)
+        interpolated_potential = (
+            self.mesh_interpolator.mesh_to_points(potential_mesh) * ivolume
+        )
+
+        interpolated_potential -= charges * self.potential.self_contribution()
+
+        charge_tot = torch.sum(charges, dim=0)
+        prefac = self.potential.background_correction()
+        interpolated_potential -= 2 * prefac * charge_tot * ivolume
+
+        interpolated_potential += self.potential.pbc_correction(
+            periodic, positions, cell, charges
+        )
+
+        return interpolated_potential / 2

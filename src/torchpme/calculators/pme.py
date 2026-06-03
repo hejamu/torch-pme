@@ -3,7 +3,7 @@ from typing import Optional
 import torch
 
 from ..lib.kspace_filter import KSpaceFilter
-from ..lib.kvectors import get_ns_mesh
+from ..lib.kvectors import generate_kvectors_for_mesh_from_shape, get_ns_mesh
 from ..lib.mesh_interpolator import MeshInterpolator
 from ..potentials import Potential
 from .calculator import Calculator
@@ -98,27 +98,80 @@ class PMECalculator(Calculator):
     ) -> torch.Tensor:
         # TODO: Kernel function `G` and initialization of `MeshInterpolator` only depend
         # on `cell`. Caching may save up to 15% but issues with AD need to be resolved.
-
-        # Compute number of times each basis vector of the reciprocal space can be
-        # scaled until the cutoff is reached
+        #
+        # NB: this is NOT that caching change. Every cell-derived quantity below is
+        # recomputed each forward, exactly as before; we only compute them as local
+        # variables instead of writing them onto `self`. Removing the per-forward state
+        # mutation (and the `int(self.ns_mesh[i])` CPU syncs, now a single sync feeding a
+        # static `ns_mesh` tuple) lets the whole forward be captured by `torch.compile`
+        # without graph breaks and makes it compatible with `mode="reduce-overhead"`
+        # (CUDA Graphs). AD on `cell` is preserved: each local stays a differentiable
+        # function of `cell`.
         if node_mask is not None or kvectors is not None:
             raise NotImplementedError(
                 "Batching not implemented for mesh-based calculators"
             )
+
+        # Number of mesh points along each axis, and a Python int triple for the pure
+        # helpers. The mesh shape is data-dependent on ``cell``, so extracting it is the
+        # single unavoidable CPU sync per forward; doing it via one ``tolist`` keeps it
+        # to a single ``torch.compile`` graph break instead of one per axis.
         ns = get_ns_mesh(cell, self.mesh_spacing)
+        ns_list: list[int] = ns.tolist()
+        ns_mesh = (ns_list[0], ns_list[1], ns_list[2])
 
-        self.mesh_interpolator.update(cell, ns)
+        if cell.is_cuda:
+            # use a routine that does not synchronize with the CPU
+            inverse_cell = torch.linalg.inv_ex(cell)[0]
+        else:
+            inverse_cell = torch.linalg.inv(cell)
 
-        self.kspace_filter.update(cell, ns)
+        # Reciprocal-space grid and filter (depend only on `cell`). The int-shaped
+        # kvector generator uses Python ints for the FFT sizes, so no extra CPU sync /
+        # graph break happens here.
+        kvectors_mesh = generate_kvectors_for_mesh_from_shape(
+            cell, inverse_cell, ns_mesh
+        )
+        k_sq = torch.linalg.norm(kvectors_mesh, dim=3) ** 2
+        kfilter = self.potential.kernel_from_k_sq(k_sq)
 
-        self.mesh_interpolator.compute_weights(positions)
-        rho_mesh = self.mesh_interpolator.points_to_mesh(particle_weights=charges)
+        # Forward interpolation: particles -> mesh (no state written to `self`).
+        (
+            interpolation_weights,
+            x_shifts,
+            y_shifts,
+            z_shifts,
+            x_indices,
+            y_indices,
+            z_indices,
+        ) = self.mesh_interpolator.compute_weights_pure(positions, inverse_cell, ns)
+        rho_mesh = self.mesh_interpolator.points_to_mesh_pure(
+            charges,
+            interpolation_weights,
+            x_shifts,
+            y_shifts,
+            z_shifts,
+            x_indices,
+            y_indices,
+            z_indices,
+            ns_mesh,
+        )
 
-        potential_mesh = self.kspace_filter.forward(rho_mesh)
+        potential_mesh = self.kspace_filter.apply_filter(rho_mesh, kfilter, ns_mesh)
 
         ivolume = torch.abs(cell.det()).pow(-1)
         interpolated_potential = (
-            self.mesh_interpolator.mesh_to_points(potential_mesh) * ivolume
+            self.mesh_interpolator.mesh_to_points_pure(
+                potential_mesh,
+                interpolation_weights,
+                x_shifts,
+                y_shifts,
+                z_shifts,
+                x_indices,
+                y_indices,
+                z_indices,
+            )
+            * ivolume
         )
 
         # Using the Coulomb potential as an example, this is the potential generated
