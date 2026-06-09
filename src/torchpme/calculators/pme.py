@@ -135,42 +135,19 @@ class PMECalculator(Calculator):
         k_sq = torch.linalg.norm(kvectors_mesh, dim=3) ** 2
         kfilter = self.potential.kernel_from_k_sq(k_sq)
 
-        # Forward interpolation: particles -> mesh (no state written to `self`).
-        (
-            interpolation_weights,
-            x_shifts,
-            y_shifts,
-            z_shifts,
-            x_indices,
-            y_indices,
-            z_indices,
-        ) = self.mesh_interpolator.compute_weights_pure(positions, inverse_cell, ns)
-        rho_mesh = self.mesh_interpolator.points_to_mesh_pure(
-            charges,
-            interpolation_weights,
-            x_shifts,
-            y_shifts,
-            z_shifts,
-            x_indices,
-            y_indices,
-            z_indices,
-            ns_mesh,
+        # Forward interpolation: particles -> mesh (no state written to `self`). The
+        # weights/shifts/indices are threaded through as a single `InterpolationData`
+        # bundle instead of seven separate locals.
+        weights = self.mesh_interpolator.compute_weights_pure(
+            positions, inverse_cell, ns
         )
+        rho_mesh = self.mesh_interpolator.points_to_mesh_pure(charges, weights, ns_mesh)
 
         potential_mesh = self.kspace_filter.apply_filter(rho_mesh, kfilter, ns_mesh)
 
         ivolume = torch.abs(cell.det()).pow(-1)
         interpolated_potential = (
-            self.mesh_interpolator.mesh_to_points_pure(
-                potential_mesh,
-                interpolation_weights,
-                x_shifts,
-                y_shifts,
-                z_shifts,
-                x_indices,
-                y_indices,
-                z_indices,
-            )
+            self.mesh_interpolator.mesh_to_points_pure(potential_mesh, weights)
             * ivolume
         )
 
