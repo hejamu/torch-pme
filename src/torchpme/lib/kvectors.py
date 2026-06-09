@@ -21,6 +21,46 @@ def get_ns_mesh(cell: torch.Tensor, mesh_spacing: float):
     return torch.pow(2, torch.ceil(torch.log2(ns_actual_approx)).long())
 
 
+def _kvectors_core(
+    inverse_cell: torch.Tensor,
+    nx: int,
+    ny: int,
+    nz: int,
+    for_ewald: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Shared core of all reciprocal-space grid generators.
+
+    Builds the reciprocal-space vectors from ``inverse_cell`` and the Python-int FFT
+    sizes ``(nx, ny, nz)``. ``for_ewald`` selects a full ``fftfreq`` on the z-axis
+    (explicit Ewald sum) versus the half-spectrum ``rfftfreq`` (FFT-based mesh). Taking
+    the sizes as concrete ints keeps :func:`torch.fft.fftfreq` free of a data-dependent
+    tensor argument, so the FFT shapes are static under ``torch.compile``.
+    """
+    reciprocal_cell = 2 * torch.pi * inverse_cell.T
+    bx = reciprocal_cell[0]
+    by = reciprocal_cell[1]
+    bz = reciprocal_cell[2]
+
+    # The frequencies from `fftfreq` are of the form [0, 1/n, 2/n, ...]; multiplying by
+    # n turns them into [0, 1, 2, ...], which then scale the reciprocal-space vectors.
+    kxs = (bx * nx) * torch.fft.fftfreq(nx, device=device, dtype=dtype).unsqueeze(-1)
+    kys = (by * ny) * torch.fft.fftfreq(ny, device=device, dtype=dtype).unsqueeze(-1)
+    if for_ewald:
+        kzs = (bz * nz) * torch.fft.fftfreq(nz, device=device, dtype=dtype).unsqueeze(
+            -1
+        )
+    else:
+        kzs = (bz * nz) * torch.fft.rfftfreq(nz, device=device, dtype=dtype).unsqueeze(
+            -1
+        )
+
+    # cartesian product via broadcasting (avoids materialising intermediates), summed up
+    return kxs[:, None, None] + kys[None, :, None] + kzs[None, None, :]
+
+
 def _generate_kvectors(
     cell: torch.Tensor, ns: torch.Tensor, for_ewald: bool
 ) -> torch.Tensor:
@@ -44,34 +84,17 @@ def _generate_kvectors(
     else:
         inverse_cell = torch.linalg.inv(cell)
 
-    reciprocal_cell = 2 * torch.pi * inverse_cell.T
-    bx = reciprocal_cell[0]
-    by = reciprocal_cell[1]
-    bz = reciprocal_cell[2]
-
-    # Generate all reciprocal space vectors from real FFT!
-    # The frequencies from the fftfreq function  are of the form [0, 1/n, 2/n, ...]
-    # These are then converted to [0, 1, 2, ...] by multiplying with n.
-    # get the frequencies, multiply with n, then w/ the reciprocal space vectors
-    kxs = (bx * ns[0]) * torch.fft.fftfreq(
-        ns[0], device=cell.device, dtype=cell.dtype
-    ).unsqueeze(-1)
-    kys = (by * ns[1]) * torch.fft.fftfreq(
-        ns[1], device=cell.device, dtype=cell.dtype
-    ).unsqueeze(-1)
-
-    if for_ewald:
-        kzs = (bz * ns[2]) * torch.fft.fftfreq(
-            ns[2], device=cell.device, dtype=cell.dtype
-        ).unsqueeze(-1)
-    else:
-        kzs = (bz * ns[2]) * torch.fft.rfftfreq(
-            ns[2], device=cell.device, dtype=cell.dtype
-        ).unsqueeze(-1)
-
-    # then take the cartesian product (all possible combinations, same as meshgrid)
-    # via broadcasting (to avoid instantiating intermediates), and sum up
-    return kxs[:, None, None] + kys[None, :, None] + kzs[None, None, :]
+    # This (tensor ``ns``) path is the stateful / Ewald one; extracting the mesh size as
+    # ints here is acceptable since it is not the ``torch.compile`` fast path.
+    return _kvectors_core(
+        inverse_cell,
+        int(ns[0]),
+        int(ns[1]),
+        int(ns[2]),
+        for_ewald,
+        cell.device,
+        cell.dtype,
+    )
 
 
 def generate_kvectors_for_mesh_from_shape(
@@ -95,23 +118,7 @@ def generate_kvectors_for_mesh_from_shape(
     :return: torch.tensor of shape ``(nx, ny, nz // 2 + 1, 3)``.
     """
     nx, ny, nz = ns_mesh
-
-    reciprocal_cell = 2 * torch.pi * inverse_cell.T
-    bx = reciprocal_cell[0]
-    by = reciprocal_cell[1]
-    bz = reciprocal_cell[2]
-
-    kxs = (bx * nx) * torch.fft.fftfreq(
-        nx, device=cell.device, dtype=cell.dtype
-    ).unsqueeze(-1)
-    kys = (by * ny) * torch.fft.fftfreq(
-        ny, device=cell.device, dtype=cell.dtype
-    ).unsqueeze(-1)
-    kzs = (bz * nz) * torch.fft.rfftfreq(
-        nz, device=cell.device, dtype=cell.dtype
-    ).unsqueeze(-1)
-
-    return kxs[:, None, None] + kys[None, :, None] + kzs[None, None, :]
+    return _kvectors_core(inverse_cell, nx, ny, nz, False, cell.device, cell.dtype)
 
 
 def generate_kvectors_for_mesh(cell: torch.Tensor, ns: torch.Tensor) -> torch.Tensor:

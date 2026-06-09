@@ -580,36 +580,9 @@ def test_pure_methods_match_class_api(interpolation_nodes, method):
 
     # Pure API: everything passed in / returned, nothing read from or written to self
     inverse_cell = torch.linalg.inv(cell)
-    (
-        weights,
-        x_shifts,
-        y_shifts,
-        z_shifts,
-        x_indices,
-        y_indices,
-        z_indices,
-    ) = mi.compute_weights_pure(positions, inverse_cell, ns_mesh)
-    rho_pure = mi.points_to_mesh_pure(
-        particle_weights,
-        weights,
-        x_shifts,
-        y_shifts,
-        z_shifts,
-        x_indices,
-        y_indices,
-        z_indices,
-        (20, 18, 16),
-    )
-    interpolated_pure = mi.mesh_to_points_pure(
-        rho_pure,
-        weights,
-        x_shifts,
-        y_shifts,
-        z_shifts,
-        x_indices,
-        y_indices,
-        z_indices,
-    )
+    weights = mi.compute_weights_pure(positions, inverse_cell, ns_mesh)
+    rho_pure = mi.points_to_mesh_pure(particle_weights, weights, (20, 18, 16))
+    interpolated_pure = mi.mesh_to_points_pure(rho_pure, weights)
 
     assert_close(rho_class, rho_pure, rtol=0.0, atol=0.0)
     assert_close(interpolated_class, interpolated_pure, rtol=0.0, atol=0.0)
