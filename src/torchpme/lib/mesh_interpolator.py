@@ -459,27 +459,35 @@ class MeshInterpolator(torch.nn.Module):
                 "of dimension 2"
             )
 
-        # Update mesh values by combining particle weights and interpolation weights
+        # Combine particle weights and interpolation weights onto the mesh. We flatten
+        # the (nx, ny, nz) grid to 1D and accumulate with ``scatter_add_`` on a single
+        # linear index, instead of ``index_put_(accumulate=True)`` with three index
+        # tensors. ``scatter_add_`` goes straight to hardware atomic adds (no internal
+        # radix sort of the ~N*nodes^3 entries), which is markedly faster for large
+        # systems. It is the linear adjoint of the gather in ``mesh_to_points_pure``, so
+        # autograd is preserved (its backward is exactly that gather).
         n_channels = particle_weights.shape[1]
         nx, ny, nz = ns_mesh
-        rho_mesh = torch.zeros(
-            (n_channels, nx, ny, nz),
+        flat_indices = (
+            (weights.x_indices * ny + weights.y_indices) * nz + weights.z_indices
+        ).reshape(-1)
+        # node weights are the same for every channel, so compute them once
+        node_weights = (
+            weights.interpolation_weights[weights.x_shifts, :, 0]
+            * weights.interpolation_weights[weights.y_shifts, :, 1]
+            * weights.interpolation_weights[weights.z_shifts, :, 2]
+        )
+        rho_flat = torch.zeros(
+            (n_channels, nx * ny * nz),
             dtype=particle_weights.dtype,
             device=particle_weights.device,
         )
         for a in range(n_channels):
-            rho_mesh[a].index_put_(
-                (weights.x_indices, weights.y_indices, weights.z_indices),
-                (
-                    particle_weights[:, a]
-                    * weights.interpolation_weights[weights.x_shifts, :, 0]
-                    * weights.interpolation_weights[weights.y_shifts, :, 1]
-                    * weights.interpolation_weights[weights.z_shifts, :, 2]
-                ),
-                accumulate=True,
+            rho_flat[a].scatter_add_(
+                0, flat_indices, (particle_weights[:, a] * node_weights).reshape(-1)
             )
 
-        return rho_mesh
+        return rho_flat.reshape(n_channels, nx, ny, nz)
 
     def points_to_mesh(self, particle_weights: torch.Tensor) -> torch.Tensor:
         """
@@ -523,16 +531,25 @@ class MeshInterpolator(torch.nn.Module):
                 f"`mesh_vals` of dimension {mesh_vals.dim()} has to be of dimension 4"
             )
 
-        return (
-            (
-                mesh_vals[:, weights.x_indices, weights.y_indices, weights.z_indices]
-                * weights.interpolation_weights[weights.x_shifts, :, 0]
-                * weights.interpolation_weights[weights.y_shifts, :, 1]
-                * weights.interpolation_weights[weights.z_shifts, :, 2]
-            )
-            .sum(dim=1)
-            .T
+        # Gather mesh values back to the particles. Mirror of ``points_to_mesh_pure``:
+        # flatten the grid and use a single 1D ``index_select`` instead of 3D advanced
+        # indexing. This is the linear adjoint of the scatter there (its backward is that
+        # scatter-add), so autograd is preserved.
+        n_channels = mesh_vals.shape[0]
+        nx, ny, nz = mesh_vals.shape[1], mesh_vals.shape[2], mesh_vals.shape[3]
+        n_nodes, n_points = weights.x_indices.shape[0], weights.x_indices.shape[1]
+        flat_indices = (
+            (weights.x_indices * ny + weights.y_indices) * nz + weights.z_indices
+        ).reshape(-1)
+        gathered = torch.index_select(
+            mesh_vals.reshape(n_channels, nx * ny * nz), 1, flat_indices
+        ).reshape(n_channels, n_nodes, n_points)
+        node_weights = (
+            weights.interpolation_weights[weights.x_shifts, :, 0]
+            * weights.interpolation_weights[weights.y_shifts, :, 1]
+            * weights.interpolation_weights[weights.z_shifts, :, 2]
         )
+        return (gathered * node_weights).sum(dim=1).T
 
     def mesh_to_points(self, mesh_vals: torch.Tensor) -> torch.Tensor:
         """
