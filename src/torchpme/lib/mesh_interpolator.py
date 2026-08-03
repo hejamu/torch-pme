@@ -59,6 +59,12 @@ class MeshInterpolator(torch.nn.Module):
         The interpolation method to use. Either "Lagrange" or "P3M".
     """
 
+    # The stored interpolation state is a single `InterpolationData`. The class-level
+    # annotation is required: without it TorchScript demotes a NamedTuple module
+    # attribute to a plain `Tuple[Tensor, ...]`, which then fails to satisfy the
+    # `-> InterpolationData` return annotations of the methods that hand it back.
+    _interpolation_data: InterpolationData
+
     def __init__(
         self,
         cell: torch.Tensor,
@@ -91,15 +97,17 @@ class MeshInterpolator(torch.nn.Module):
         self.update(cell, ns_mesh)
 
         # TorchScript requires to initialize all attributes in __init__
-        self.interpolation_weights: torch.Tensor = torch.zeros(
-            1, device=self._device, dtype=self._dtype
+        self._interpolation_data = InterpolationData(
+            interpolation_weights=torch.zeros(
+                1, device=self._device, dtype=self._dtype
+            ),
+            x_shifts=torch.zeros(1, device=self._device),
+            y_shifts=torch.zeros(1, device=self._device),
+            z_shifts=torch.zeros(1, device=self._device),
+            x_indices=torch.zeros(1, device=self._device),
+            y_indices=torch.zeros(1, device=self._device),
+            z_indices=torch.zeros(1, device=self._device),
         )
-        self.x_shifts: torch.Tensor = torch.zeros(1, device=self._device)
-        self.y_shifts: torch.Tensor = torch.zeros(1, device=self._device)
-        self.z_shifts: torch.Tensor = torch.zeros(1, device=self._device)
-        self.x_indices: torch.Tensor = torch.zeros(1, device=self._device)
-        self.y_indices: torch.Tensor = torch.zeros(1, device=self._device)
-        self.z_indices: torch.Tensor = torch.zeros(1, device=self._device)
 
     def update(
         self,
@@ -432,14 +440,9 @@ class MeshInterpolator(torch.nn.Module):
                 f"device {self._device}"
             )
 
-        data = self.compute_weights_pure(positions, self.inverse_cell, self.ns_mesh)
-        self.interpolation_weights = data.interpolation_weights
-        self.x_shifts = data.x_shifts
-        self.y_shifts = data.y_shifts
-        self.z_shifts = data.z_shifts
-        self.x_indices = data.x_indices
-        self.y_indices = data.y_indices
-        self.z_indices = data.z_indices
+        self._interpolation_data = self.compute_weights_pure(
+            positions, self.inverse_cell, self.ns_mesh
+        )
 
     def points_to_mesh_pure(
         self,
@@ -515,7 +518,9 @@ class MeshInterpolator(torch.nn.Module):
             int(self.ns_mesh[1]),
             int(self.ns_mesh[2]),
         )
-        return self.points_to_mesh_pure(particle_weights, self._weights(), ns_mesh)
+        return self.points_to_mesh_pure(
+            particle_weights, self._interpolation_data, ns_mesh
+        )
 
     def mesh_to_points_pure(
         self,
@@ -566,19 +571,4 @@ class MeshInterpolator(torch.nn.Module):
         :return: interpolated_values: torch.tensor of shape ``(n_points, n_channels)``
             Values of the interpolated function.
         """
-        return self.mesh_to_points_pure(mesh_vals, self._weights())
-
-    def _weights(self) -> InterpolationData:
-        """
-        Bundle the stored (stateful) weights/shifts/indices into an
-        :class:`InterpolationData` so the stateful API can reuse the pure methods.
-        """
-        return InterpolationData(
-            self.interpolation_weights,
-            self.x_shifts,
-            self.y_shifts,
-            self.z_shifts,
-            self.x_indices,
-            self.y_indices,
-            self.z_indices,
-        )
+        return self.mesh_to_points_pure(mesh_vals, self._interpolation_data)
