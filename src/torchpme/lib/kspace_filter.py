@@ -4,6 +4,97 @@ import torch
 from .kvectors import generate_kvectors_for_mesh
 
 
+def _reduce_to(grad: torch.Tensor, shape) -> torch.Tensor:
+    """Sum ``grad`` down to ``shape`` (undo broadcasting), as autograd would."""
+    while grad.dim() > len(shape):
+        grad = grad.sum(dim=0)
+    for d, s in enumerate(shape):
+        if s == 1 and grad.shape[d] != 1:
+            grad = grad.sum(dim=d, keepdim=True)
+    return grad
+
+
+# ---------------------------------------------------------------------------
+# Fast, ``torch.compile``-safe k-space convolution ``y = irfftn(rfftn(x) * f)``
+# (the FFT round-trip inside :func:`KSpaceFilter.forward`).
+#
+# PyTorch differentiates ``rfftn``/``irfftn`` generically by routing the backward
+# through full-complex (c2c) transforms with conjugate-symmetry padding, which on GPU
+# shows up as oversized FFT kernels plus large ``memcpy128`` copies. We avoid that by
+# exploiting the structure: with a *real* filter ``f`` (as produced by
+# ``kernel_from_k_sq`` for any radial kernel), ``x -> y`` is a circular convolution
+# with a real, even real-space kernel, hence **self-adjoint** for the
+# ``("backward", "forward")`` normalization pair used by the mesh calculators (verified
+# numerically and by :func:`torch.autograd.gradcheck`). Each gradient is then one
+# r2c + one c2r transform, with no full-complex intermediates:
+#
+#   * ``grad_x = irfftn(rfftn(grad_y) * f)``  (the operator applied to ``grad_y``)
+#   * ``grad_f[k] = sum_channels w[k] Re(conj(rfftn(grad_y)[k]) * rfftn(x)[k])``
+#
+# where ``w`` doubles every rfft bin except DC (and Nyquist for even ``nz``), undoing
+# the half-spectrum redundancy. The ``grad_f`` line preserves autograd w.r.t. ``cell``
+# (the filter depends on the cell via ``k_sq``).
+#
+# Registered as a ``torch.library`` custom op rather than an ``autograd.Function``:
+# the latter's saved tensors become graph intermediates inside ``PMECalculator``, and
+# AOTAutograd's min-cut partitioner then mis-handles its backward under
+# ``torch.compile`` (silently wrong ``cell`` gradients). A registered op is opaque to
+# the partitioner, so the registered backward is used verbatim.
+# ---------------------------------------------------------------------------
+@torch.library.custom_op("torchpme::filter_conv", mutates_args=())
+def _filter_conv(
+    mesh_values: torch.Tensor, kfilter: torch.Tensor, nx: int, ny: int, nz: int
+) -> torch.Tensor:
+    dims = [1, 2, 3]
+    mesh_hat = torch.fft.rfftn(mesh_values, norm="backward", dim=dims)
+    return torch.fft.irfftn(
+        mesh_hat * kfilter, norm="forward", dim=dims, s=[nx, ny, nz]
+    )
+
+
+@_filter_conv.register_fake
+def _(mesh_values, kfilter, nx, ny, nz):
+    return mesh_values.new_empty((mesh_values.shape[0], nx, ny, nz))
+
+
+def _filter_conv_setup(ctx, inputs, output):
+    mesh_values, kfilter, nx, ny, nz = inputs
+    ctx.save_for_backward(mesh_values, kfilter)
+    ctx.nz = nz
+    ctx.shape = (nx, ny, nz)
+
+
+def _filter_conv_backward(ctx, grad_out):
+    mesh_values, kfilter = ctx.saved_tensors
+    nx, ny, nz = ctx.shape
+    dims = [1, 2, 3]
+
+    grad_mesh = grad_kfilter = None
+    grad_hat = torch.fft.rfftn(grad_out, norm="backward", dim=dims)
+
+    if ctx.needs_input_grad[0]:
+        grad_mesh = torch.fft.irfftn(
+            grad_hat * kfilter, norm="forward", dim=dims, s=[nx, ny, nz]
+        )
+    if ctx.needs_input_grad[1]:
+        mesh_hat = torch.fft.rfftn(mesh_values, norm="backward", dim=dims)
+        # rfftn stores only half the spectrum; every bin along the last axis other
+        # than DC (and Nyquist for even nz) stands in for a conjugate pair, so its
+        # contribution to the real filter gradient must be doubled.
+        nzh = grad_hat.shape[-1]
+        idx = torch.arange(nzh, device=grad_hat.device)
+        self_conj = idx == 0
+        if nz % 2 == 0:
+            self_conj = self_conj | (idx == nzh - 1)
+        w = torch.where(self_conj, 1.0, 2.0).to(grad_hat.real.dtype)
+        full = (grad_hat.conj() * mesh_hat).real * w
+        grad_kfilter = _reduce_to(full, kfilter.shape)
+    return grad_mesh, grad_kfilter, None, None, None
+
+
+_filter_conv.register_autograd(_filter_conv_backward, setup_context=_filter_conv_setup)
+
+
 class KSpaceKernel(torch.nn.Module):
     r"""
     Base class defining the interface for a reciprocal-space kernel helper.
@@ -166,25 +257,47 @@ class KSpaceFilter(torch.nn.Module):
         # is in the backward transformation) and vice versa for the
         # inverse transform (irfft).
 
-        dims = (1, 2, 3)  # dimensions along which to Fourier transform
-        mesh_hat = torch.fft.rfftn(mesh_values, norm=self._fft_norm, dim=dims)
-
-        if mesh_hat.shape[-3:] != self._kfilter.shape[-3:]:
+        nx = mesh_values.shape[-3]
+        ny = mesh_values.shape[-2]
+        nz = mesh_values.shape[-1]
+        # the real-space mesh must be commensurate with the k-space grid: the
+        # ``rfftn`` output is ``(n_channels, nx, ny, nz // 2 + 1)``
+        ksh = self._kfilter.shape
+        if ksh[-3] != nx or ksh[-2] != ny or ksh[-1] != nz // 2 + 1:
             raise ValueError(
                 "The real-space mesh is inconsistent with the k-space grid."
             )
 
-        filter_hat = mesh_hat * self._kfilter
-
-        result = torch.fft.irfftn(
-            filter_hat,
-            norm=self._ifft_norm,
-            dim=dims,
-            # NB: we must specify the size of the output
-            # as for certain mesh sizes the inverse FT is not
-            # well-defined
-            s=mesh_values.shape[-3:],
-        )
+        # Fast path: a real filter with the ("backward", "forward") norm pair makes the
+        # FFT round-trip a self-adjoint convolution, so ``_filter_conv`` gives the same
+        # result with a much cheaper backward (one r2c + one c2r per gradient instead of
+        # PyTorch's generic full-complex FFT backward). This pays off under
+        # ``torch.compile`` (where the generic FFT backward materializes oversized c2c
+        # transforms and large copies); in plain eager the custom-op dispatch overhead
+        # can exceed the saving at small meshes, so the fast path is taken only when
+        # compiling. The NaN guard below is kept for both paths. TorchScript does not
+        # trace ``torch.library`` ops, hence the ``is_scripting`` guard.
+        if (
+            not torch.jit.is_scripting()
+            and torch.compiler.is_compiling()
+            and self._fft_norm == "backward"
+            and self._ifft_norm == "forward"
+            and not torch.is_complex(self._kfilter)
+        ):
+            result = _filter_conv(mesh_values, self._kfilter, nx, ny, nz)
+        else:
+            dims = (1, 2, 3)  # dimensions along which to Fourier transform
+            mesh_hat = torch.fft.rfftn(mesh_values, norm=self._fft_norm, dim=dims)
+            filter_hat = mesh_hat * self._kfilter
+            result = torch.fft.irfftn(
+                filter_hat,
+                norm=self._ifft_norm,
+                dim=dims,
+                # NB: we must specify the size of the output
+                # as for certain mesh sizes the inverse FT is not
+                # well-defined
+                s=mesh_values.shape[-3:],
+            )
 
         if torch.isnan(result).any():
             raise ValueError(

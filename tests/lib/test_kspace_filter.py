@@ -179,3 +179,50 @@ def test_fft_modes():
     match = "Invalid option 'faster' for the `ifft_norm` parameter."
     with pytest.raises(ValueError, match=match):
         KSpaceFilter(cell, ns, KSpaceKernel(), ifft_norm="faster")
+@pytest.mark.parametrize("ns_mesh", [(8, 8, 8), (9, 8, 7), (7, 6, 5), (10, 10, 10)])
+@pytest.mark.parametrize("n_channels", [1, 2])
+def test_filter_conv_matches_generic_autograd(ns_mesh, n_channels):
+    """The fast self-adjoint ``apply_filter`` path agrees with generic FFT autograd.
+
+    Checks forward values and gradients w.r.t. both the mesh and the (cell-dependent)
+    filter against the plain ``irfftn(rfftn(x) * f)`` reference differentiated by
+    PyTorch's generic FFT autograd.
+    """
+    from torchpme.lib.kspace_filter import _filter_conv
+
+    nx, ny, nz = ns_mesh
+    torch.manual_seed(nx * 100 + ny * 10 + nz + n_channels)
+    x = torch.randn(n_channels, nx, ny, nz, dtype=torch.float64)
+    f = torch.rand(nx, ny, nz // 2 + 1, dtype=torch.float64)
+    g = torch.randn(n_channels, nx, ny, nz, dtype=torch.float64)
+
+    def reference(x_, f_):
+        h = torch.fft.rfftn(x_, norm="backward", dim=[1, 2, 3])
+        return torch.fft.irfftn(h * f_, norm="forward", dim=[1, 2, 3], s=[nx, ny, nz])
+
+    xf = x.clone().requires_grad_(True)
+    ff = f.clone().requires_grad_(True)
+    out_fast = _filter_conv(xf, ff, nx, ny, nz)
+    out_fast.backward(g)
+
+    xr = x.clone().requires_grad_(True)
+    fr = f.clone().requires_grad_(True)
+    out_ref = reference(xr, fr)
+    out_ref.backward(g)
+
+    torch.testing.assert_close(out_fast, out_ref, atol=1e-12, rtol=0.0)
+    torch.testing.assert_close(xf.grad, xr.grad, atol=1e-10, rtol=0.0)
+    torch.testing.assert_close(ff.grad, fr.grad, atol=1e-10, rtol=0.0)
+
+
+def test_filter_conv_gradcheck():
+    """`torch.autograd.gradcheck` on the custom k-space convolution operator."""
+    from torchpme.lib.kspace_filter import _filter_conv
+
+    nx, ny, nz = 6, 5, 4
+    torch.manual_seed(0)
+    x = torch.randn(2, nx, ny, nz, dtype=torch.float64, requires_grad=True)
+    f = torch.rand(nx, ny, nz // 2 + 1, dtype=torch.float64, requires_grad=True)
+    assert torch.autograd.gradcheck(
+        lambda x_, f_: _filter_conv(x_, f_, nx, ny, nz), (x, f), atol=1e-6, rtol=1e-4
+    )
