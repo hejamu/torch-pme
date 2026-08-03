@@ -10,6 +10,7 @@ from torchpme.lib import (
     generate_kvectors_for_mesh,
     get_ns_mesh,
 )
+from torchpme.lib.kvectors import _next_fast_len
 
 sys.path.append(str(Path(__file__).parents[1]))
 from helpers import DEVICES
@@ -146,3 +147,36 @@ def test_get_ns_mesh_on_device(device):
     assert ns.device.type == torch.device(device).type
     assert ns.shape == (3,)
     assert (ns > 0).all()
+
+
+def _is_7_smooth(n):
+    for p in (2, 3, 5, 7):
+        while n % p == 0:
+            n //= p
+    return n == 1
+
+
+@pytest.mark.parametrize("n", [*range(1, 300), 1009, 4097, 30000])
+def test_next_fast_len(n):
+    """``_next_fast_len`` returns the smallest 7-smooth integer >= n."""
+    fast = _next_fast_len(n)
+    assert fast >= n
+    assert _is_7_smooth(fast)
+    # smallest: no 7-smooth integer in [n, fast)
+    assert not any(_is_7_smooth(m) for m in range(n, fast))
+
+
+@pytest.mark.parametrize(
+    ("n", "expected"), [(8, 8), (11, 12), (139, 140), (211, 216), (257, 270)]
+)
+def test_next_fast_len_values(n, expected):
+    assert _next_fast_len(n) == expected
+
+
+def test_get_ns_mesh_resolution_lower_bound():
+    """The mesh must never be coarser than the ``mesh_spacing`` target."""
+    for length in torch.linspace(2.0, 80.0, 64):
+        cell = torch.eye(3) * length
+        ns = get_ns_mesh(cell, 1.0)
+        assert (ns >= torch.ceil(2 * length / 1.0 + 1)).all()
+        assert all(_is_7_smooth(int(n)) for n in ns)

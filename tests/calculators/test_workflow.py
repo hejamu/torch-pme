@@ -275,7 +275,7 @@ def test_kspace_filter_error_catch():
     match = (
         "NaNs detected in the k-space filter result. This are probably caused "
         "by an unsuitable `mesh_spacing`, resulting in a problematic grid of "
-        r"shape: \[1, 16, 16, 32\]. Try adjsuting the grid by using a "
+        r"shape: \[1, 12, 12, 27\]. Try adjsuting the grid by using a "
         "different `mesh_spacing` value."
     )
     with pytest.raises(ValueError, match=match):

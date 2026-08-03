@@ -269,7 +269,11 @@ def test_random_structure(
     elif calc_name == "p3m":
         calc = P3MCalculator(
             CoulombPotential(smearing=smearing, prefactor=torchpme.prefactors.eV_A),
-            mesh_spacing=smearing / 8.0,
+            # The P3M *stress* (strain derivative of the cell-dependent influence
+            # function) needs a finer mesh than energies/forces to meet the rtol=5e-3
+            # check below. With the old power-of-2 mesh rounding, `smearing / 8.0`
+            # silently overshot to an equivalent resolution.
+            mesh_spacing=smearing / 14.0,
             full_neighbor_list=full_neighbor_list,
         )
 

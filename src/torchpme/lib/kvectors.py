@@ -2,23 +2,53 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 
 
+def _is_7_smooth(n: int) -> bool:
+    """True if ``n`` factors into only the primes 2, 3, 5, 7."""
+    for p in (2, 3, 5, 7):
+        while n % p == 0:
+            n = n // p
+    return n == 1
+
+
+def _next_fast_len(n: int) -> int:
+    """
+    Smallest 7-smooth integer >= n, i.e. of the form ``2^a * 3^b * 5^c * 7^d``. FFT
+    libraries (pocketfft, cuFFT) have fast kernels for these radices, so such sizes are
+    as FFT-friendly as powers of 2 while staying much closer to ``n`` (cf.
+    ``scipy.fft.next_fast_len``). 7-smooth gaps are small in the mesh-size range (<=~30
+    up to 512), so simply stepping up is cheap.
+    """
+    while not _is_7_smooth(n):
+        n += 1
+    return n
+
+
 def get_ns_mesh(cell: torch.Tensor, mesh_spacing: float):
     """
-    Computes the mesh size given a target mesh spacing and cell
-    getting the closest powers of 2 to help with FFT.
+    Computes the mesh size given a target mesh spacing and cell,
+    getting the closest FFT-friendly ("7-smooth") size along each axis.
+
+    The mesh is never coarser than the size implied by ``mesh_spacing``;
+    rounding up to the next 7-smooth integer (instead of the next power of 2)
+    keeps the mesh close to the requested resolution, so the cost and accuracy
+    of mesh-based calculators vary smoothly with the cell size.
 
     :param cell: torch.tensor of shape ``(3, 3)``, where ``cell[i]`` is the i-th basis
         vector of the unit cell
     :param mesh_spacing: float
-    :param differentiable: boll
 
     :return: torch.tensor of length 3 containing the mesh size
     """
     basis_norms = torch.linalg.norm(cell, dim=1)
     ns_approx = basis_norms / mesh_spacing
     ns_actual_approx = 2 * ns_approx + 1  # actual number of mesh points
-    # ns = [nx, ny, nz], closest power of 2 (helps for FT efficiency).
-    return torch.pow(2, torch.ceil(torch.log2(ns_actual_approx)).long())
+
+    # Round each axis up to the nearest FFT-friendly ("7-smooth") size. `_next_fast_len`
+    # works on Python ints, so extract the three sizes with a single `tolist` (one CPU
+    # sync) and round each of them.
+    ns_ceil: list[int] = torch.ceil(ns_actual_approx).long().tolist()
+    ns_smooth = [_next_fast_len(n) for n in ns_ceil]
+    return torch.tensor(ns_smooth, device=cell.device, dtype=torch.long)
 
 
 def _generate_kvectors(
