@@ -149,8 +149,17 @@ def test_get_ns_mesh_on_device(device):
     assert (ns > 0).all()
 
 
-def _is_7_smooth(n):
-    for p in (2, 3, 5, 7):
+def test_get_ns_mesh_torchscript():
+    """Scripted and eager ``get_ns_mesh`` agree and return integer sizes."""
+    cell = torch.eye(3) * 23.7
+    ns = get_ns_mesh(cell, 1.0)
+    ns_script = torch.jit.script(get_ns_mesh)(cell, 1.0)
+    assert ns.dtype == ns_script.dtype == torch.long
+    assert torch.equal(ns, ns_script)
+
+
+def _is_5_smooth(n):
+    for p in (2, 3, 5):
         while n % p == 0:
             n //= p
     return n == 1
@@ -158,16 +167,17 @@ def _is_7_smooth(n):
 
 @pytest.mark.parametrize("n", [*range(1, 300), 1009, 4097, 30000])
 def test_next_fast_len(n):
-    """``_next_fast_len`` returns the smallest 7-smooth integer >= n."""
+    """``_next_fast_len`` returns the smallest 5-smooth integer >= n."""
     fast = _next_fast_len(n)
     assert fast >= n
-    assert _is_7_smooth(fast)
-    # smallest: no 7-smooth integer in [n, fast)
-    assert not any(_is_7_smooth(m) for m in range(n, fast))
+    assert _is_5_smooth(fast)
+    # smallest: no 5-smooth integer in [n, fast)
+    assert not any(_is_5_smooth(m) for m in range(n, fast))
 
 
 @pytest.mark.parametrize(
-    ("n", "expected"), [(8, 8), (11, 12), (139, 140), (211, 216), (257, 270)]
+    ("n", "expected"),
+    [(8, 8), (11, 12), (139, 144), (211, 216), (245, 250), (257, 270)],
 )
 def test_next_fast_len_values(n, expected):
     assert _next_fast_len(n) == expected
@@ -179,4 +189,4 @@ def test_get_ns_mesh_resolution_lower_bound():
         cell = torch.eye(3) * length
         ns = get_ns_mesh(cell, 1.0)
         assert (ns >= torch.ceil(2 * length / 1.0 + 1)).all()
-        assert all(_is_7_smooth(int(n)) for n in ns)
+        assert all(_is_5_smooth(int(n)) for n in ns)

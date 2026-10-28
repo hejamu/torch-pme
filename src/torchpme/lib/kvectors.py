@@ -2,9 +2,9 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 
 
-def _is_7_smooth(n: int) -> bool:
-    """True if ``n`` factors into only the primes 2, 3, 5, 7."""
-    for p in (2, 3, 5, 7):
+def _is_5_smooth(n: int) -> bool:
+    """True if ``n`` factors into only the primes 2, 3, 5."""
+    for p in (2, 3, 5):
         while n % p == 0:
             n = n // p
     return n == 1
@@ -12,13 +12,13 @@ def _is_7_smooth(n: int) -> bool:
 
 def _next_fast_len(n: int) -> int:
     """
-    Smallest 7-smooth integer >= n, i.e. of the form ``2^a * 3^b * 5^c * 7^d``. FFT
-    libraries (pocketfft, cuFFT) have fast kernels for these radices, so such sizes are
-    as FFT-friendly as powers of 2 while staying much closer to ``n`` (cf.
-    ``scipy.fft.next_fast_len``). 7-smooth gaps are small in the mesh-size range (<=~30
-    up to 512), so simply stepping up is cheap.
+    Smallest integer ``>= n`` of the form ``2^a * 3^b * 5^c``. FFT libraries (pocketfft,
+    cuFFT) have fast kernels for these radices, so such sizes are about as fast as powers
+    of 2 while staying much closer to ``n``. Factors of 7 are left out: they are often
+    slower than the next ``2^a * 3^b * 5^c`` size, by up to ~3x on cuFFT. The gaps are
+    small in the mesh-size range, so simply stepping up is cheap.
     """
-    while not _is_7_smooth(n):
+    while not _is_5_smooth(n):
         n += 1
     return n
 
@@ -26,10 +26,10 @@ def _next_fast_len(n: int) -> int:
 def get_ns_mesh(cell: torch.Tensor, mesh_spacing: float):
     """
     Computes the mesh size given a target mesh spacing and cell,
-    getting the closest FFT-friendly ("7-smooth") size along each axis.
+    getting the closest FFT-friendly size ``2^a * 3^b * 5^c`` along each axis.
 
     The mesh is never coarser than the size implied by ``mesh_spacing``;
-    rounding up to the next 7-smooth integer (instead of the next power of 2)
+    rounding up to the next such size (instead of the next power of 2)
     keeps the mesh close to the requested resolution, so the cost and accuracy
     of mesh-based calculators vary smoothly with the cell size.
 
@@ -43,9 +43,9 @@ def get_ns_mesh(cell: torch.Tensor, mesh_spacing: float):
     ns_approx = basis_norms / mesh_spacing
     ns_actual_approx = 2 * ns_approx + 1  # actual number of mesh points
 
-    # Round each axis up to the nearest FFT-friendly ("7-smooth") size. `_next_fast_len`
-    # works on Python ints, so extract the three sizes with a single `tolist` (one CPU
-    # sync) and round each of them.
+    # Round each axis up to the nearest FFT-friendly size. `_next_fast_len` works on
+    # Python ints, so extract the three sizes with a single `tolist` (one CPU sync,
+    # which callers need anyway to shape the mesh) and round each of them.
     ns_ceil: list[int] = torch.ceil(ns_actual_approx).long().tolist()
     ns_smooth = [_next_fast_len(n) for n in ns_ceil]
     return torch.tensor(ns_smooth, device=cell.device, dtype=torch.long)
