@@ -27,6 +27,12 @@ changelog <https://keepachangelog.com/en/1.1.0/>`_ format. This project follows
 Added
 #####
 
+* State-free ("pure") entry points for the PME k-space path:
+  ``MeshInterpolator.compute_weights_pure`` / ``points_to_mesh_pure`` /
+  ``mesh_to_points_pure`` (bundling their tensors in ``InterpolationData``),
+  ``KSpaceFilter.apply_filter``, ``lib.get_ns_mesh_shape`` and
+  ``lib.generate_kvectors_for_mesh_from_shape``. The stateful API is unchanged and
+  now delegates to them.
 * Support for Python 3.15.
 
 Fixed
@@ -41,6 +47,11 @@ Fixed
 Changed
 #######
 
+* ``PMECalculator._compute_kspace`` no longer writes per-forward state to its
+  ``MeshInterpolator`` / ``KSpaceFilter``; all cell-derived quantities are locals. Under
+  ``torch.compile`` the forward is captured with the single mesh-shape sync as the only
+  graph break and ``mode="reduce-overhead"`` (CUDA Graphs) works. ``P3MCalculator``
+  keeps the stateful path. Results are unchanged.
 * ``PMECalculator`` is ``torch.compile``-friendly: FFT sizes are passed to
   :func:`torch.fft.fftfreq` as Python ints and ``MeshInterpolator`` caches the mesh shape
   at ``update`` time instead of reading it from the tensor in every forward. Graph

@@ -3,6 +3,7 @@ from .kvectors import (
     compute_batched_kvectors,
     generate_kvectors_for_ewald,
     generate_kvectors_for_mesh,
+    generate_kvectors_for_mesh_from_shape,
     get_ns_mesh,
 )
 from .math import exp1, gamma, gammaincc_over_powerlaw
@@ -27,6 +28,7 @@ __all__ = [
     "distances",
     "generate_kvectors_for_ewald",
     "generate_kvectors_for_mesh",
+    "generate_kvectors_for_mesh_from_shape",
     "compute_batched_kvectors",
     "get_ns_mesh",
     "gamma",

@@ -186,6 +186,35 @@ class KSpaceFilter(torch.nn.Module):
             s=mesh_values.shape[-3:],
         )
 
+    def apply_filter(
+        self,
+        mesh_values: torch.Tensor,
+        kfilter: torch.Tensor,
+        ns_mesh: tuple[int, int, int],
+    ) -> torch.Tensor:
+        """
+        Pure, ``torch.compile``-friendly version of :func:`forward`: the filter
+        ``kfilter`` and the mesh shape ``ns_mesh`` are passed as arguments instead of
+        read from ``self``, so no per-call state (``self._kfilter``) is read and the
+        mesh shape is a Python ``(int, int, int)`` tuple (no ``int(tensor)`` CPU sync /
+        graph break).
+
+        :param mesh_values: torch.tensor of shape ``(n_channels, nx, ny, nz)``.
+        :param kfilter: torch.tensor with the reciprocal-space filter, matching the
+            ``rfftn`` output shape, i.e. ``(nx, ny, nz // 2 + 1)``.
+        :param ns_mesh: the real-space mesh shape ``(nx, ny, nz)``.
+        :returns: torch.tensor of shape ``(n_channels, nx, ny, nz)``.
+        """
+        dims = [1, 2, 3]
+        mesh_hat = torch.fft.rfftn(mesh_values, norm=self._fft_norm, dim=dims)
+        filter_hat = mesh_hat * kfilter
+        return torch.fft.irfftn(
+            filter_hat,
+            norm=self._ifft_norm,
+            dim=dims,
+            s=[ns_mesh[0], ns_mesh[1], ns_mesh[2]],
+        )
+
     def _prep_kvectors(self, cell: torch.Tensor | None, ns_mesh: torch.Tensor | None):
         if cell is not None:
             if cell.shape != (3, 3):
