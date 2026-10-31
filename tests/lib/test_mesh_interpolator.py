@@ -32,7 +32,10 @@ class TestMeshInterpolatorForward:
         n_channels = 5
         L = torch.tensor(6.28318530717)  # tau
 
-        # Generate inputs for interpolator class
+        # Generate inputs for interpolator class. Seeded: the check below runs in
+        # float32 with a 3e-6 tolerance on a sum that can be close to zero, so an
+        # unlucky draw (which depends on the tests that ran before) fails it.
+        torch.manual_seed(int(n_mesh) * 10 + interpolation_nodes)
         cell = torch.eye(3) * L
         positions = torch.rand((n_particles, 3)) * L
         particle_weights = 3 * torch.randn((n_particles, n_channels))
