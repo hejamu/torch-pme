@@ -49,24 +49,33 @@ def _generate_kvectors(
     by = reciprocal_cell[1]
     bz = reciprocal_cell[2]
 
+    # The FFT sizes are needed as Python ints by `fftfreq`. Extract all three with a
+    # single `tolist()` (one CPU sync) instead of indexing the tensor three times:
+    # under `torch.compile` a tensor-valued size is a data-dependent operation that
+    # breaks the graph at every use, a single `tolist()` is one break.
+    ns_list: list[int] = ns.tolist()
+    nx = ns_list[0]
+    ny = ns_list[1]
+    nz = ns_list[2]
+
     # Generate all reciprocal space vectors from real FFT!
     # The frequencies from the fftfreq function  are of the form [0, 1/n, 2/n, ...]
     # These are then converted to [0, 1, 2, ...] by multiplying with n.
     # get the frequencies, multiply with n, then w/ the reciprocal space vectors
-    kxs = (bx * ns[0]) * torch.fft.fftfreq(
-        ns[0], device=cell.device, dtype=cell.dtype
+    kxs = (bx * nx) * torch.fft.fftfreq(
+        nx, device=cell.device, dtype=cell.dtype
     ).unsqueeze(-1)
-    kys = (by * ns[1]) * torch.fft.fftfreq(
-        ns[1], device=cell.device, dtype=cell.dtype
+    kys = (by * ny) * torch.fft.fftfreq(
+        ny, device=cell.device, dtype=cell.dtype
     ).unsqueeze(-1)
 
     if for_ewald:
-        kzs = (bz * ns[2]) * torch.fft.fftfreq(
-            ns[2], device=cell.device, dtype=cell.dtype
+        kzs = (bz * nz) * torch.fft.fftfreq(
+            nz, device=cell.device, dtype=cell.dtype
         ).unsqueeze(-1)
     else:
-        kzs = (bz * ns[2]) * torch.fft.rfftfreq(
-            ns[2], device=cell.device, dtype=cell.dtype
+        kzs = (bz * nz) * torch.fft.rfftfreq(
+            nz, device=cell.device, dtype=cell.dtype
         ).unsqueeze(-1)
 
     # then take the cartesian product (all possible combinations, same as meshgrid)

@@ -29,6 +29,15 @@ Added
 
 * Support for Python 3.15.
 
+Changed
+#######
+
+* ``PMECalculator`` is ``torch.compile``-friendly: FFT sizes are passed to
+  :func:`torch.fft.fftfreq` as Python ints, ``MeshInterpolator`` caches the mesh shape
+  at ``update`` time instead of reading it from the tensor in every forward, and the
+  NaN check of ``KSpaceFilter.forward`` runs in eager mode only. Graph breaks in
+  ``PMECalculator.forward`` drop from 16 to the mesh-shape CPU syncs.
+
 Fixed
 #####
 

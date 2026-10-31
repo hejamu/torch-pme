@@ -186,7 +186,12 @@ class KSpaceFilter(torch.nn.Module):
             s=mesh_values.shape[-3:],
         )
 
-        if torch.isnan(result).any():
+        # The NaN check is data-dependent control flow (a device->host sync and a
+        # `torch.compile` graph break), so it is only run in eager mode. TorchScript
+        # cannot script `torch.compiler.is_compiling`, hence the `is_scripting` guard.
+        if (
+            torch.jit.is_scripting() or not torch.compiler.is_compiling()
+        ) and torch.isnan(result).any():
             raise ValueError(
                 "NaNs detected in the k-space filter result. This are probably caused "
                 "by an unsuitable `mesh_spacing`, resulting in a problematic grid of "
