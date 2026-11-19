@@ -1,4 +1,27 @@
+from typing import NamedTuple
+
 import torch
+
+
+class InterpolationData(NamedTuple):
+    """
+    Bundle of the per-particle interpolation weights, axis shifts and mesh indices
+    produced by :meth:`MeshInterpolator.compute_weights_pure` and consumed by
+    :meth:`MeshInterpolator.points_to_mesh_pure` /
+    :meth:`MeshInterpolator.mesh_to_points_pure`.
+
+    Grouping the seven tensors lets the pure (state-free) API thread them through as a
+    single value instead of seven positional arguments, while staying TorchScript- and
+    ``torch.compile``-compatible.
+    """
+
+    interpolation_weights: torch.Tensor
+    x_shifts: torch.Tensor
+    y_shifts: torch.Tensor
+    z_shifts: torch.Tensor
+    x_indices: torch.Tensor
+    y_indices: torch.Tensor
+    z_indices: torch.Tensor
 
 
 class MeshInterpolator(torch.nn.Module):
@@ -315,21 +338,28 @@ class MeshInterpolator(torch.nn.Module):
             )
         raise ValueError("Only `interpolation_nodes` from 3 to 7 are allowed")
 
-    def compute_weights(self, positions: torch.Tensor):
+    def compute_weights_pure(
+        self,
+        positions: torch.Tensor,
+        inverse_cell: torch.Tensor,
+        ns_mesh: tuple[int, int, int],
+    ) -> InterpolationData:
         """
-        Compute the interpolation weights of each atom for a given cell (specified
-        during initialization of this class). The weights are not returned, but are used
-        when calling the forward (:func:`points_to_mesh`) and backward
-        (:func:`mesh_to_points`) interpolation functions.
+        Pure version of :func:`compute_weights`: takes ``inverse_cell`` and ``ns_mesh``
+        as arguments instead of reading them from ``self``, and *returns* the computed
+        weights/shifts/indices (as an :class:`InterpolationData`) rather than writing
+        them back to ``self``. This makes the method free of per-call state mutation,
+        which is required for full ``torch.compile`` (including
+        ``mode="reduce-overhead"``).
 
-        :param positions: torch.tensor of shape ``(N, 3)`` containing the Cartesian
-            coordinates of the ``N`` particles within the supercell.
+        :param positions: torch.tensor of shape ``(N, 3)`` with the Cartesian
+            coordinates of the ``N`` particles.
+        :param inverse_cell: torch.tensor of shape ``(3, 3)``, the inverse of ``cell``.
+        :param ns_mesh: mesh resolution as a Python ``(nx, ny, nz)`` int triple.
+        :return: an :class:`InterpolationData` bundling ``interpolation_weights``,
+            the ``x/y/z_shifts`` and the ``x/y/z_indices``.
         """
-        if positions.device != self._device:
-            raise ValueError(
-                f"`positions` device {positions.device} is not the same as instance "
-                f"device {self._device}"
-            )
+        device = positions.device
 
         n_positions = len(positions)
         if positions.shape != (n_positions, 3):
@@ -338,7 +368,9 @@ class MeshInterpolator(torch.nn.Module):
             )
 
         # Compute positions relative to the mesh basis vectors
-        positions_rel = self.ns_mesh * torch.matmul(positions, self.inverse_cell)
+        nx, ny, nz = ns_mesh
+        ns = torch.tensor([nx, ny, nz], device=device, dtype=torch.long)
+        positions_rel = ns * torch.matmul(positions, inverse_cell)
 
         # Calculate positions and distances based on interpolation nodes
         even = self.interpolation_nodes % 2 == 0
@@ -356,23 +388,23 @@ class MeshInterpolator(torch.nn.Module):
             offsets = positions_rel - positions_rel_idx
 
         # Compute weights based on distances and number of nodes
-        self.interpolation_weights = self._compute_1d_weights(offsets)
+        interpolation_weights = self._compute_1d_weights(offsets)
 
         # Calculate indices of mesh points on which the particle weights are
         # interpolated. For each particle, its weight is "smeared" onto
         # `interpolation_nodes**3` mesh points, which can be achived using meshgrid
         # below.
         # The periodic wrap divides each axis by its mesh size as a Python int. A
-        # tensor-valued divisor (``% self.ns_mesh``) makes Inductor's CPU backend
+        # tensor-valued divisor (``% ns_mesh``) makes Inductor's CPU backend
         # vectorise the integer remainder over the length-3 divisor and spuriously
         # raise ZeroDivisionError, see https://github.com/pytorch/pytorch/issues/143649
         indices_to_interpolate = torch.stack(
             [
                 torch.stack(
                     [
-                        (positions_rel_idx[:, 0] + i) % self._nx,
-                        (positions_rel_idx[:, 1] + i) % self._ny,
-                        (positions_rel_idx[:, 2] + i) % self._nz,
+                        (positions_rel_idx[:, 0] + i) % nx,
+                        (positions_rel_idx[:, 1] + i) % ny,
+                        (positions_rel_idx[:, 2] + i) % nz,
                     ],
                     dim=-1,
                 )
@@ -386,21 +418,98 @@ class MeshInterpolator(torch.nn.Module):
 
         # Generate shifts for x, y, z axes and flatten for indexing
         x_shifts, y_shifts, z_shifts = torch.meshgrid(
-            torch.arange(self.interpolation_nodes, device=self._device),
-            torch.arange(self.interpolation_nodes, device=self._device),
-            torch.arange(self.interpolation_nodes, device=self._device),
+            torch.arange(self.interpolation_nodes, device=device),
+            torch.arange(self.interpolation_nodes, device=device),
+            torch.arange(self.interpolation_nodes, device=device),
             indexing="ij",
         )
-        self.x_shifts = x_shifts.flatten()
-        self.y_shifts = y_shifts.flatten()
-        self.z_shifts = z_shifts.flatten()
+        x_shifts = x_shifts.flatten()
+        y_shifts = y_shifts.flatten()
+        z_shifts = z_shifts.flatten()
 
         # Generate a flattened representation of all the indices
         # of the mesh points on which we wish to interpolate the
         # density.
-        self.x_indices = indices_to_interpolate[self.x_shifts, :, 0]
-        self.y_indices = indices_to_interpolate[self.y_shifts, :, 1]
-        self.z_indices = indices_to_interpolate[self.z_shifts, :, 2]
+        x_indices = indices_to_interpolate[x_shifts, :, 0]
+        y_indices = indices_to_interpolate[y_shifts, :, 1]
+        z_indices = indices_to_interpolate[z_shifts, :, 2]
+
+        return InterpolationData(
+            interpolation_weights,
+            x_shifts,
+            y_shifts,
+            z_shifts,
+            x_indices,
+            y_indices,
+            z_indices,
+        )
+
+    def compute_weights(self, positions: torch.Tensor):
+        """
+        Compute the interpolation weights of each atom for a given cell (specified
+        during initialization of this class). The weights are not returned, but are used
+        when calling the forward (:func:`points_to_mesh`) and backward
+        (:func:`mesh_to_points`) interpolation functions.
+
+        :param positions: torch.tensor of shape ``(N, 3)`` containing the Cartesian
+            coordinates of the ``N`` particles within the supercell.
+        """
+        if positions.device != self._device:
+            raise ValueError(
+                f"`positions` device {positions.device} is not the same as instance "
+                f"device {self._device}"
+            )
+
+        data = self.compute_weights_pure(
+            positions, self.inverse_cell, (self._nx, self._ny, self._nz)
+        )
+        self.interpolation_weights = data.interpolation_weights
+        self.x_shifts = data.x_shifts
+        self.y_shifts = data.y_shifts
+        self.z_shifts = data.z_shifts
+        self.x_indices = data.x_indices
+        self.y_indices = data.y_indices
+        self.z_indices = data.z_indices
+
+    def points_to_mesh_pure(
+        self,
+        particle_weights: torch.Tensor,
+        weights: InterpolationData,
+        ns_mesh: tuple[int, int, int],
+    ) -> torch.Tensor:
+        """
+        Pure version of :func:`points_to_mesh`: the interpolation ``weights`` bundle and
+        the mesh shape ``ns_mesh`` are passed as arguments instead of read from ``self``.
+        The mesh shape is a Python ``(int, int, int)`` tuple, so no ``int(tensor)`` CPU
+        sync (and the associated ``torch.compile`` graph break) happens here.
+        """
+        if particle_weights.dim() != 2:
+            raise ValueError(
+                f"`particle_weights` of dimension {particle_weights.dim()} has to be "
+                "of dimension 2"
+            )
+
+        # Update mesh values by combining particle weights and interpolation weights
+        n_channels = particle_weights.shape[1]
+        nx, ny, nz = ns_mesh
+        rho_mesh = torch.zeros(
+            (n_channels, nx, ny, nz),
+            dtype=weights.interpolation_weights.dtype,
+            device=weights.interpolation_weights.device,
+        )
+        for a in range(n_channels):
+            rho_mesh[a].index_put_(
+                (weights.x_indices, weights.y_indices, weights.z_indices),
+                (
+                    particle_weights[:, a]
+                    * weights.interpolation_weights[weights.x_shifts, :, 0]
+                    * weights.interpolation_weights[weights.y_shifts, :, 1]
+                    * weights.interpolation_weights[weights.z_shifts, :, 2]
+                ),
+                accumulate=True,
+            )
+
+        return rho_mesh
 
     def points_to_mesh(self, particle_weights: torch.Tensor) -> torch.Tensor:
         """
@@ -423,32 +532,34 @@ class MeshInterpolator(torch.nn.Module):
                 f"as instance device {self._device}"
             )
 
-        if particle_weights.dim() != 2:
-            raise ValueError(
-                f"`particle_weights` of dimension {particle_weights.dim()} has to be "
-                "of dimension 2"
-            )
-
-        # Update mesh values by combining particle weights and interpolation weights
-        n_channels = particle_weights.shape[1]
-        rho_mesh = torch.zeros(
-            (n_channels, self._nx, self._ny, self._nz),
-            dtype=self._dtype,
-            device=self._device,
+        return self.points_to_mesh_pure(
+            particle_weights, self._weights(), (self._nx, self._ny, self._nz)
         )
-        for a in range(n_channels):
-            rho_mesh[a].index_put_(
-                (self.x_indices, self.y_indices, self.z_indices),
-                (
-                    particle_weights[:, a]
-                    * self.interpolation_weights[self.x_shifts, :, 0]
-                    * self.interpolation_weights[self.y_shifts, :, 1]
-                    * self.interpolation_weights[self.z_shifts, :, 2]
-                ),
-                accumulate=True,
+
+    def mesh_to_points_pure(
+        self,
+        mesh_vals: torch.Tensor,
+        weights: InterpolationData,
+    ) -> torch.Tensor:
+        """
+        Pure version of :func:`mesh_to_points`: the interpolation ``weights`` bundle is
+        passed as an argument instead of read from ``self``.
+        """
+        if mesh_vals.dim() != 4:
+            raise ValueError(
+                f"`mesh_vals` of dimension {mesh_vals.dim()} has to be of dimension 4"
             )
 
-        return rho_mesh
+        return (
+            (
+                mesh_vals[:, weights.x_indices, weights.y_indices, weights.z_indices]
+                * weights.interpolation_weights[weights.x_shifts, :, 0]
+                * weights.interpolation_weights[weights.y_shifts, :, 1]
+                * weights.interpolation_weights[weights.z_shifts, :, 2]
+            )
+            .sum(dim=1)
+            .T
+        )
 
     def mesh_to_points(self, mesh_vals: torch.Tensor) -> torch.Tensor:
         """
@@ -465,18 +576,19 @@ class MeshInterpolator(torch.nn.Module):
         :return: interpolated_values: torch.tensor of shape ``(n_points, n_channels)``
             Values of the interpolated function.
         """
-        if mesh_vals.dim() != 4:
-            raise ValueError(
-                f"`mesh_vals` of dimension {mesh_vals.dim()} has to be of dimension 4"
-            )
+        return self.mesh_to_points_pure(mesh_vals, self._weights())
 
-        return (
-            (
-                mesh_vals[:, self.x_indices, self.y_indices, self.z_indices]
-                * self.interpolation_weights[self.x_shifts, :, 0]
-                * self.interpolation_weights[self.y_shifts, :, 1]
-                * self.interpolation_weights[self.z_shifts, :, 2]
-            )
-            .sum(dim=1)
-            .T
+    def _weights(self) -> InterpolationData:
+        """
+        Bundle the stored (stateful) weights/shifts/indices into an
+        :class:`InterpolationData` so the stateful API can reuse the pure methods.
+        """
+        return InterpolationData(
+            self.interpolation_weights,
+            self.x_shifts,
+            self.y_shifts,
+            self.z_shifts,
+            self.x_indices,
+            self.y_indices,
+            self.z_indices,
         )

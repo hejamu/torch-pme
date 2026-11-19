@@ -550,3 +550,66 @@ def test_wrong_method():
     match = "method 'foo' is not supported. Choose from 'Lagrange' or 'P3M'"
     with pytest.raises(ValueError, match=match):
         MeshInterpolator(torch.eye(3), torch.ones(3), 2, method="foo")
+
+
+@pytest.mark.parametrize(
+    ("interpolation_nodes", "method"),
+    [(n, "P3M") for n in [1, 2, 3, 4, 5]] + [(n, "Lagrange") for n in [3, 4, 5, 6, 7]],
+)
+def test_pure_methods_match_class_api(interpolation_nodes, method):
+    """
+    The pure (``*_pure``) methods must produce bit-identical results to the
+    stateful class API they back.
+    """
+    torch.manual_seed(0)
+    n_particles, n_channels = 12, 3
+    L = 6.28318530717
+    cell = torch.eye(3) * L
+    ns_mesh = torch.tensor([20, 18, 16])
+    positions = torch.rand((n_particles, 3)) * L
+    particle_weights = 3 * torch.randn((n_particles, n_channels))
+
+    mi = MeshInterpolator(
+        cell=cell,
+        ns_mesh=ns_mesh,
+        interpolation_nodes=interpolation_nodes,
+        method=method,
+    )
+
+    # Stateful class API
+    mi.compute_weights(positions)
+    rho_class = mi.points_to_mesh(particle_weights)
+    interpolated_class = mi.mesh_to_points(rho_class)
+
+    # Pure API: everything passed in / returned, nothing read from or written to self
+    inverse_cell = torch.linalg.inv(cell)
+    weights = mi.compute_weights_pure(positions, inverse_cell, (20, 18, 16))
+    rho_pure = mi.points_to_mesh_pure(particle_weights, weights, (20, 18, 16))
+    interpolated_pure = mi.mesh_to_points_pure(rho_pure, weights)
+
+    assert_close(rho_class, rho_pure, rtol=0.0, atol=0.0)
+    assert_close(interpolated_class, interpolated_pure, rtol=0.0, atol=0.0)
+
+
+def test_pure_api_mixed_dtype():
+    """float32 particle weights on a float64 cell: the mesh follows the cell dtype."""
+    torch.manual_seed(0)
+    cell = torch.eye(3, dtype=torch.float64) * 6.0
+    ns_mesh = (12, 10, 8)
+    positions = torch.rand((7, 3), dtype=torch.float64) * 6.0
+    particle_weights = torch.randn((7, 2), dtype=torch.float32)
+
+    mi = MeshInterpolator(
+        cell=cell,
+        ns_mesh=torch.tensor(ns_mesh),
+        interpolation_nodes=4,
+        method="Lagrange",
+    )
+    mi.compute_weights(positions)
+    rho_class = mi.points_to_mesh(particle_weights)
+
+    weights = mi.compute_weights_pure(positions, torch.linalg.inv(cell), ns_mesh)
+    rho_pure = mi.points_to_mesh_pure(particle_weights, weights, ns_mesh)
+
+    assert rho_pure.dtype == torch.float64
+    assert_close(rho_class, rho_pure, rtol=0.0, atol=0.0)
