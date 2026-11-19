@@ -64,10 +64,11 @@ def _system(device, dtype, n=60, length=8.0):
     return charges, cell, positions, neighbor_indices, neighbor_distances, periodic
 
 
-def _calculator(device, dtype):
+def _calculator(device, dtype, ns_mesh=None):
     calc = torchpme.PMECalculator(
         potential=torchpme.CoulombPotential(smearing=SMEARING),
         mesh_spacing=MESH_SPACING,
+        ns_mesh=ns_mesh,
     )
     calc.to(device=device, dtype=dtype)
     return calc
@@ -191,3 +192,77 @@ def test_pme_compile_fluctuating_cell(device):
 
     assert not torch.allclose(e1, e2)
     assert_close(e1, e1_again, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_pme_fixed_ns_mesh_matches_adaptive(device, dtype):
+    """
+    A fixed ``ns_mesh`` equal to what ``get_ns_mesh`` would derive gives bit-identical
+    energies (eager) and preserves AD w.r.t. ``cell``.
+    """
+    charges, cell, pos, ni, nd, per = _system(device, dtype)
+    ns = torchpme.lib.get_ns_mesh(cell, MESH_SPACING).tolist()
+
+    adaptive = _calculator(device, dtype)
+    fixed = _calculator(device, dtype, ns_mesh=(ns[0], ns[1], ns[2]))
+
+    e_adaptive = adaptive.forward(charges, cell, pos, ni, nd, periodic=per)
+    e_fixed = fixed.forward(charges, cell, pos, ni, nd, periodic=per)
+    assert_close(e_fixed, e_adaptive, rtol=0.0, atol=0.0)
+
+    cell_g = cell.clone().requires_grad_(True)
+    grad = torch.autograd.grad(
+        fixed.forward(charges, cell_g, pos, ni, nd, periodic=per).sum(), cell_g
+    )[0]
+    assert torch.isfinite(grad).all()
+    assert grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_pme_fixed_ns_mesh_zero_graph_breaks(device):
+    """With a fixed ``ns_mesh`` the forward is captured as a single graph."""
+    import torch._dynamo as dynamo
+
+    dtype = torch.float64
+    charges, cell, pos, ni, nd, per = _system(device, dtype)
+    ns = torchpme.lib.get_ns_mesh(cell, MESH_SPACING).tolist()
+    calc = _calculator(device, dtype, ns_mesh=(ns[0], ns[1], ns[2]))
+
+    dynamo.reset()
+    explanation = dynamo.explain(calc.forward)(charges, cell, pos, ni, nd, periodic=per)
+    assert explanation.graph_break_count == 0, (
+        f"unexpected graph breaks: {explanation.break_reasons}"
+    )
+    assert explanation.graph_count == 1
+
+    compiled = torch.compile(calc.forward, mode="default")
+    with _suppress_torch_internal_warnings():
+        out = compiled(charges, cell, pos, ni, nd, periodic=per)
+    eager = calc.forward(charges, cell, pos, ni, nd, periodic=per)
+    assert_close(out, eager, rtol=1e-10, atol=1e-10)
+
+
+@pytest.mark.parametrize("ns_mesh", [(16, 16), (16, 16, 0), (16, -8, 16)])
+def test_pme_fixed_ns_mesh_invalid(ns_mesh):
+    match = "`ns_mesh` must be three positive integers"
+    with pytest.raises(ValueError, match=match):
+        torchpme.PMECalculator(
+            potential=torchpme.CoulombPotential(smearing=SMEARING),
+            mesh_spacing=MESH_SPACING,
+            ns_mesh=ns_mesh,
+        )
+
+
+def test_pme_fixed_ns_mesh_scriptable():
+    """TorchScript still scripts the calculator with a fixed mesh shape."""
+    calc = torchpme.PMECalculator(
+        potential=torchpme.CoulombPotential(smearing=SMEARING),
+        mesh_spacing=MESH_SPACING,
+        ns_mesh=(16, 16, 16),
+    )
+    scripted = torch.jit.script(calc)
+    charges, cell, pos, ni, nd, per = _system("cpu", torch.float64)
+    e_script = scripted(charges, cell, pos, ni, nd, periodic=per)
+    e_eager = calc.forward(charges, cell, pos, ni, nd, periodic=per)
+    assert_close(e_script, e_eager, rtol=0.0, atol=0.0)

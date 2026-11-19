@@ -42,7 +42,18 @@ class PMECalculator(Calculator):
     :param full_neighbor_list: If set to :obj:`True`, a "full" neighbor list
         is expected as input. This means that each atom pair appears twice. If
         set to :obj:`False`, a "half" neighbor list is expected.
+    :param ns_mesh: Optional fixed mesh shape ``(nx, ny, nz)``. By default the mesh
+        shape is derived from ``cell`` and ``mesh_spacing`` in every forward, which
+        costs one device-to-host sync (and one ``torch.compile`` graph break) per call.
+        Passing a fixed shape skips that: the forward then compiles into a single graph
+        and can be captured as one CUDA graph with ``mode="reduce-overhead"``. Use it
+        when the cell is fixed or only fluctuates mildly (e.g. NpT); ``mesh_spacing`` is
+        then only used for the error bounds and the shape is **not** adapted to the
+        cell, so pick it from :func:`torchpme.lib.get_ns_mesh` on a representative cell.
     """
+
+    # TorchScript requires class-level annotations for non-Tensor list attributes.
+    _fixed_ns_mesh: list[int]
 
     def __init__(
         self,
@@ -50,6 +61,7 @@ class PMECalculator(Calculator):
         mesh_spacing: float,
         interpolation_nodes: int = 4,
         full_neighbor_list: bool = False,
+        ns_mesh: tuple[int, int, int] | None = None,
     ):
         super().__init__(potential=potential, full_neighbor_list=full_neighbor_list)
 
@@ -61,6 +73,22 @@ class PMECalculator(Calculator):
             raise ValueError(f"`smearing` is {potential.smearing} but must be positive")
 
         self.mesh_spacing: float = mesh_spacing
+
+        # When set, ``_fixed_ns_mesh`` is a length-3 list of ints that bypasses the
+        # per-forward ``get_ns_mesh_shape`` CPU sync entirely: Dynamo specialises the
+        # values as constants, so the forward compiles to a single graph. The
+        # cell-derived quantities (k-vectors, filter, weights) are still recomputed each
+        # forward, so autograd on ``cell`` is preserved. When empty the adaptive path is
+        # used (one ``tolist`` sync per forward). A ``list[int]`` rather than a tuple
+        # keeps TorchScript happy.
+        if ns_mesh is not None:
+            if len(ns_mesh) != 3 or any(int(n) <= 0 for n in ns_mesh):
+                raise ValueError(
+                    f"`ns_mesh` must be three positive integers, got {ns_mesh}"
+                )
+            self._fixed_ns_mesh = [int(n) for n in ns_mesh]
+        else:
+            self._fixed_ns_mesh = []
 
         cell = torch.eye(
             3,
@@ -110,11 +138,19 @@ class PMECalculator(Calculator):
                 "Batching not implemented for mesh-based calculators"
             )
 
-        # Number of mesh points along each axis, as a Python int triple for the pure
-        # helpers. The mesh shape is data-dependent on ``cell``, so extracting it is the
-        # single unavoidable CPU sync per forward; ``get_ns_mesh_shape`` does it with one
-        # ``tolist`` (one graph break).
-        ns_mesh = get_ns_mesh_shape(cell, self.mesh_spacing)
+        # Mesh shape as a Python int triple for the pure helpers. Fixed path: the shape
+        # was given at construction and is a compile-time constant (no CPU sync, no
+        # graph break). Adaptive path: the shape is data-dependent on ``cell``, so
+        # extracting it is the single unavoidable sync per forward; ``get_ns_mesh_shape``
+        # does it with one ``tolist`` (one graph break).
+        if len(self._fixed_ns_mesh) == 3:
+            ns_mesh = (
+                self._fixed_ns_mesh[0],
+                self._fixed_ns_mesh[1],
+                self._fixed_ns_mesh[2],
+            )
+        else:
+            ns_mesh = get_ns_mesh_shape(cell, self.mesh_spacing)
 
         if cell.is_cuda:
             # use a routine that does not synchronize with the CPU

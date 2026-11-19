@@ -27,6 +27,11 @@ changelog <https://keepachangelog.com/en/1.1.0/>`_ format. This project follows
 Added
 #####
 
+* ``PMECalculator(..., ns_mesh=(nx, ny, nz))``: optional fixed mesh shape. It skips the
+  per-forward mesh-shape sync, so under ``torch.compile`` the forward is captured as a
+  single graph (zero graph breaks) and as one CUDA graph with
+  ``mode="reduce-overhead"``. The default (``None``) keeps deriving the shape from the
+  cell in every forward.
 * State-free ("pure") entry points for the PME k-space path:
   ``MeshInterpolator.compute_weights_pure`` / ``points_to_mesh_pure`` /
   ``mesh_to_points_pure`` (bundling their tensors in ``InterpolationData``),
