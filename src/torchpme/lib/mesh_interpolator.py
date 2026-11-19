@@ -1,14 +1,6 @@
 import torch
 
 
-# Runs eagerly: Inductor's CPU backend spuriously raises ZeroDivisionError on
-# vectorized `%` with an odd-length divisor (here always 3), see
-# https://github.com/pytorch/pytorch/issues/143649
-@torch.compiler.disable
-def _mesh_index_remainder(indices: torch.Tensor, ns_mesh: torch.Tensor) -> torch.Tensor:
-    return indices % ns_mesh
-
-
 class MeshInterpolator(torch.nn.Module):
     """
     Class for handling all steps related to interpolations in the context of a mesh
@@ -73,6 +65,14 @@ class MeshInterpolator(torch.nn.Module):
         self.method: str = method
         self.interpolation_nodes: int = interpolation_nodes
 
+        # Mesh shape as Python ints, refreshed in `update`. Reading the shape from the
+        # `ns_mesh` tensor in every forward (`int(self.ns_mesh[i])`) costs a CPU sync
+        # per axis and a `torch.compile` graph break per call; caching it here moves
+        # that to a single sync at update time.
+        self._nx: int = 0
+        self._ny: int = 0
+        self._nz: int = 0
+
         self.update(cell, ns_mesh)
 
         # TorchScript requires to initialize all attributes in __init__
@@ -125,6 +125,13 @@ class MeshInterpolator(torch.nn.Module):
                     f"shape {list(ns_mesh.shape)} of `ns_mesh` has to be (3,)"
                 )
             self.ns_mesh = ns_mesh
+            # `tolist` has no meta-device implementation; such an instance only
+            # carries dtype/device information and is never used for interpolation.
+            if ns_mesh.device.type != "meta":
+                ns_list: list[int] = ns_mesh.tolist()
+                self._nx = ns_list[0]
+                self._ny = ns_list[1]
+                self._nz = ns_list[2]
 
         if self.cell.device != self.ns_mesh.device:
             raise ValueError(
@@ -355,9 +362,20 @@ class MeshInterpolator(torch.nn.Module):
         # interpolated. For each particle, its weight is "smeared" onto
         # `interpolation_nodes**3` mesh points, which can be achived using meshgrid
         # below.
+        # The periodic wrap divides each axis by its mesh size as a Python int. A
+        # tensor-valued divisor (``% self.ns_mesh``) makes Inductor's CPU backend
+        # vectorise the integer remainder over the length-3 divisor and spuriously
+        # raise ZeroDivisionError, see https://github.com/pytorch/pytorch/issues/143649
         indices_to_interpolate = torch.stack(
             [
-                _mesh_index_remainder(positions_rel_idx + i, self.ns_mesh)
+                torch.stack(
+                    [
+                        (positions_rel_idx[:, 0] + i) % self._nx,
+                        (positions_rel_idx[:, 1] + i) % self._ny,
+                        (positions_rel_idx[:, 2] + i) % self._nz,
+                    ],
+                    dim=-1,
+                )
                 for i in range(
                     1 - (self.interpolation_nodes + 1) // 2,
                     1 + self.interpolation_nodes // 2,
@@ -413,11 +431,10 @@ class MeshInterpolator(torch.nn.Module):
 
         # Update mesh values by combining particle weights and interpolation weights
         n_channels = particle_weights.shape[1]
-        nx = int(self.ns_mesh[0])
-        ny = int(self.ns_mesh[1])
-        nz = int(self.ns_mesh[2])
         rho_mesh = torch.zeros(
-            (n_channels, nx, ny, nz), dtype=self._dtype, device=self._device
+            (n_channels, self._nx, self._ny, self._nz),
+            dtype=self._dtype,
+            device=self._device,
         )
         for a in range(n_channels):
             rho_mesh[a].index_put_(

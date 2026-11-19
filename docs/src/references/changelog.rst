@@ -38,6 +38,20 @@ Fixed
   perpendicular cell height, preserving energies and forces under rigid rotations
   and nonorthogonal cell choices.
 
+Changed
+#######
+
+* ``PMECalculator`` is ``torch.compile``-friendly: FFT sizes are passed to
+  :func:`torch.fft.fftfreq` as Python ints and ``MeshInterpolator`` caches the mesh shape
+  at ``update`` time instead of reading it from the tensor in every forward. Graph
+  breaks in ``PMECalculator.forward`` drop from 16 to the mesh-shape CPU syncs.
+
+Removed
+#######
+
+* ``KSpaceFilter.forward`` no longer checks its result for NaNs and no longer raises
+  a ``ValueError`` for them. The check cost a device-to-host sync in every forward.
+
 `Version 0.5.0 <https://github.com/lab-cosmo/torch-pme/releases/tag/v0.5.0>`_ - 2026-06-30
 ------------------------------------------------------------------------------------------
 
