@@ -1,9 +1,9 @@
 """
 ``torch.compile`` behaviour tests for ``PMECalculator``.
 
-The mesh path reads the mesh shape as Python ints and runs the NaN check only in
-eager mode, so ``torch.compile`` captures the forward with the mesh-shape CPU syncs as
-the only graph breaks (no per-axis ``int(tensor)`` calls, no data-dependent jumps).
+The mesh path reads the mesh shape as Python ints, so ``torch.compile`` captures the
+forward with the mesh-shape CPU syncs as the only graph breaks (no per-axis
+``int(tensor)`` calls, no data-dependent jumps).
 """
 
 import sys
@@ -92,7 +92,7 @@ def test_pme_compile_graph_breaks_only_mesh_shape_sync(device):
 
     The mesh shape ``(nx, ny, nz)`` is data-dependent on ``cell``, so extracting it as
     Python ints (``tolist``) is an unavoidable sync. Everything else (k-vectors,
-    interpolation, FFT filter, NaN check, corrections) must capture without breaking.
+    interpolation, FFT filter, corrections) must capture without breaking.
     """
     import torch._dynamo as dynamo
 

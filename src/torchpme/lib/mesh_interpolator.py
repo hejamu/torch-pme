@@ -362,9 +362,20 @@ class MeshInterpolator(torch.nn.Module):
         # interpolated. For each particle, its weight is "smeared" onto
         # `interpolation_nodes**3` mesh points, which can be achived using meshgrid
         # below.
+        # The periodic wrap divides each axis by its mesh size as a Python int. A
+        # tensor-valued divisor (``% self.ns_mesh``) makes Inductor's CPU backend
+        # vectorise the integer remainder over the length-3 divisor and spuriously
+        # raise ZeroDivisionError, see https://github.com/pytorch/pytorch/issues/143649
         indices_to_interpolate = torch.stack(
             [
-                (positions_rel_idx + i) % self.ns_mesh
+                torch.stack(
+                    [
+                        (positions_rel_idx[:, 0] + i) % self._nx,
+                        (positions_rel_idx[:, 1] + i) % self._ny,
+                        (positions_rel_idx[:, 2] + i) % self._nz,
+                    ],
+                    dim=-1,
+                )
                 for i in range(
                     1 - (self.interpolation_nodes + 1) // 2,
                     1 + self.interpolation_nodes // 2,
